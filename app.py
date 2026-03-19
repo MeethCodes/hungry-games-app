@@ -9,85 +9,53 @@ import os
 # --- CONFIG & AUTH SETUP ---
 def get_gspread_client():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    
-    # Check for local file first (for your PC)
     if os.path.exists("secrets.json"):
-        try:
-            creds = Credentials.from_service_account_file("secrets.json", scopes=scope)
-            return gspread.authorize(creds)
-        except Exception as e:
-            st.error(f"Local JSON File Error: {e}")
-            return None
-    
-    # If no local file, try Streamlit Cloud secrets
-    try:
-        if "gcp_service_account" in st.secrets:
-            creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
-            return gspread.authorize(creds)
-    except Exception as e:
-        st.error("Authentication Error: Could not find secrets.json locally or Cloud secrets.")
-        return None
+        creds = Credentials.from_service_account_file("secrets.json", scopes=scope)
+        return gspread.authorize(creds)
+    elif "gcp_service_account" in st.secrets:
+        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
+        return gspread.authorize(creds)
+    return None
 
 client = get_gspread_client()
-
-# Only proceed if we connected successfully
 if client:
-    try:
-        sheet = client.open("Hungry_Games_DB")
-        user_wks = sheet.worksheet("Users")
-        log_wks = sheet.worksheet("Logs")
-    except Exception as e:
-        st.error(f"Spreadsheet Error: Ensure the sheet name is 'Hungry_Games_DB' and you shared it with the bot email. Error: {e}")
+    sheet = client.open("Hungry_Games_DB")
+    user_wks = sheet.worksheet("Users")
+    log_wks = sheet.worksheet("Logs")
 
 def hash_pass(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
-# --- APP UI ---
 st.set_page_config(page_title="Hungry Games OS", layout="wide")
 
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
 
-# --- AUTHENTICATION FLOW ---
+# --- AUTH FLOW ---
 if not st.session_state['logged_in']:
     st.title("🛡️ HUNGRY GAMES: ACCESS CONTROL")
     choice = st.selectbox("Action", ["Login", "Register New Player"])
-
     if choice == "Register New Player":
         with st.form("Onboarding"):
-            u = st.text_input("Choose Username")
-            p = st.text_input("Set Password", type="password")
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
             h = st.number_input("Height (cm)", value=170)
             w = st.number_input("Weight (kg)", value=70.0)
             tw = st.number_input("Target Weight (kg)", value=65.0)
-            days = st.number_input("Target Timeline (Days)", value=90)
-            
             if st.form_submit_button("Initialize Profile"):
                 bmi = w / ((h/100)**2)
-                # Assignment logic: BMI > 23 is Team Loss (Toning), < 18.5 is Team Gain
                 team = "Team Loss" if bmi > 23 else "Team Gain"
-                
-                try:
-                    user_wks.append_row([u, hash_pass(p), 21, h, w, tw, days, team, 0, 0, "None", 0])
-                    st.success(f"Profile Created! You are assigned to **{team}**. Now please select 'Login' above.")
-                except Exception as e:
-                    st.error(f"Registry Error: {e}")
-
+                user_wks.append_row([u, hash_pass(p), 21, h, w, tw, 90, team, 0, 0, "None", 0])
+                st.success(f"Welcome to {team}! Login to enter.")
     else:
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
         if st.button("Enter Arena"):
-            try:
-                users = pd.DataFrame(user_wks.get_all_records())
-                if not users.empty and u in users['username'].values:
-                    db_p = users[users['username'] == u]['password'].values[0]
-                    if db_p == hash_pass(p):
-                        st.session_state['logged_in'] = True
-                        st.session_state['user'] = u
-                        st.rerun()
-                st.error("Invalid Credentials.")
-            except Exception as e:
-                st.error(f"Login System Error: {e}")
+            users = pd.DataFrame(user_wks.get_all_records())
+            if u in users['username'].values and users[users['username'] == u]['password'].values[0] == hash_pass(p):
+                st.session_state['logged_in'], st.session_state['user'] = True, u
+                st.rerun()
+            st.error("Invalid Credentials.")
 
 # --- THE GAME DASHBOARD ---
 else:
@@ -96,9 +64,7 @@ else:
     me = users_df[users_df['username'] == user].iloc[0]
 
     st.sidebar.title(f"👋 Welcome, {user}!")
-    st.sidebar.metric("Your Points", me['points'])
-    st.sidebar.metric("Team", me['team'])
-    
+    st.sidebar.metric("Points", me['points'])
     if st.sidebar.button("Logout"):
         st.session_state['logged_in'] = False
         st.rerun()
@@ -107,28 +73,33 @@ else:
 
     with tabs[0]:
         st.header("The Leaderboard")
-        leaderboard = users_df[['username', 'points', 'team', 'streak']].sort_values(by='points', ascending=False)
-        st.dataframe(leaderboard, use_container_width=True)
+        st.dataframe(users_df[['username', 'points', 'team', 'streak']].sort_values(by='points', ascending=False), width='stretch')
 
     with tabs[1]:
         st.header("Meal Submission")
-        meal_type = st.selectbox("What are you logging?", ["Photo Sent to WhatsApp (50 pts)", "Text Description Only (10 pts)"])
-        meal_desc = st.text_input("Describe your meal (e.g., 'Dal Chawal + 2 Eggs')")
-        
-        if st.button("Submit to Registry"):
+        meal_type = st.selectbox("Type", ["Photo Sent (50 pts)", "Text Only (10 pts)"])
+        meal_desc = st.text_input("What did you eat?")
+        if st.button("Submit"):
             pts = 50 if "Photo" in meal_type else 10
             log_wks.append_row([str(datetime.now()), user, meal_desc, pts, "Verified", 0])
-            
-            # Update user points in the main sheet
             cell = user_wks.find(user)
-            new_pts = int(me['points']) + pts
-            user_wks.update_cell(cell.row, 9, new_pts) # Col 9 is Points
-            
-            st.balloons()
-            st.success(f"Success! {pts} points added to your score.")
+            user_wks.update_cell(cell.row, 9, int(me['points']) + pts)
+            st.success("Points Added!")
+            st.rerun()
 
     with tabs[2]:
-        st.header("The Jury Box")
-        st.write("Recent activity for auditing:")
+        st.header("⚖️ The Jury Box")
+        st.write("Click a button to flag a suspicious entry. 3 flags = Penalty.")
         logs_df = pd.DataFrame(log_wks.get_all_records()).tail(10)
-        st.table(logs_df)
+        
+        for i, row in logs_df.iterrows():
+            # Don't let users vote on their own meals
+            if row['username'] != user:
+                with st.expander(f"Audit: {row['username']} - {row['meal_type']}"):
+                    col1, col2, col3 = st.columns(3)
+                    if col1.button(f"🚨 JUNK!", key=f"j_{i}"):
+                        st.error(f"Voted JUNK for {row['username']}")
+                    if col2.button(f"📷 NO PHOTO!", key=f"p_{i}"):
+                        st.warning("Flagged: Missing Photo")
+                    if col3.button(f"👻 NO UPDATE!", key=f"u_{i}"):
+                        st.info("Flagged: Ghost Log")
